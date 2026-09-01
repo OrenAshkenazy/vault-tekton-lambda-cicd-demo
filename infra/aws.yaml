@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Minimal AWS resources for the Vault and Tekton AssumeRole demo.
+
+Parameters:
+  BucketName:
+    Type: String
+
+Resources:
+  DemoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DemoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DemoBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt DemoBucket.Arn
+              - !Sub "${DemoBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  VaultBootstrapUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: vault-tekton-demo-bootstrap
+
+  CameraUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: VaultTektonDemoCameraUploader
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt VaultBootstrapUser.Arn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteOnlyEventsPrefix
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOnlyEventsPrefix
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${DemoBucket.Arn}/events/*"
+
+  VaultBootstrapPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: VaultTektonDemoBootstrap
+      Users:
+        - !Ref VaultBootstrapUser
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AssumeOnlyDemoRole
+            Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !GetAtt CameraUploaderRole.Arn
+          - Sid: RotateOwnAccessKey
+            Effect: Allow
+            Action:
+              - iam:CreateAccessKey
+              - iam:DeleteAccessKey
+              - iam:GetUser
+              - iam:ListAccessKeys
+            Resource: !GetAtt VaultBootstrapUser.Arn
+
+Outputs:
+  BucketName:
+    Value: !Ref DemoBucket
+  CameraUploaderRoleArn:
+    Value: !GetAtt CameraUploaderRole.Arn
+  VaultBootstrapUserName:
+    Value: !Ref VaultBootstrapUser

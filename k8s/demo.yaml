@@ -1,0 +1,194 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vault-tekton-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: camera-gateway
+  namespace: vault-tekton-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tekton-deployer
+  namespace: vault-tekton-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gateway-job-manager
+  namespace: vault-tekton-demo
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tekton-deployer
+  namespace: vault-tekton-demo
+subjects:
+  - kind: ServiceAccount
+    name: tekton-deployer
+    namespace: vault-tekton-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gateway-job-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-tekton-demo-token-review
+subjects:
+  - kind: ServiceAccount
+    name: vault
+    namespace: vault
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: synthetic-camera-event
+  namespace: vault-tekton-demo
+data:
+  event.json: |
+    {
+      "eventId": "demo-001",
+      "cameraId": "synthetic-camera-01",
+      "timestamp": "2026-09-01T10:00:00Z",
+      "type": "synthetic-event"
+    }
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: onprem-vault-assumerole
+  namespace: vault-tekton-demo
+spec:
+  params:
+    - name: aws-region
+      type: string
+      default: il-central-1
+    - name: bucket
+      type: string
+    - name: gateway-image
+      type: string
+      default: vault-tekton-demo:local
+    - name: run-id
+      type: string
+  tasks:
+    - name: deploy-gateway
+      taskSpec:
+        params:
+          - name: aws-region
+            type: string
+          - name: bucket
+            type: string
+          - name: gateway-image
+            type: string
+          - name: run-id
+            type: string
+        steps:
+          - name: deploy
+            image: registry.k8s.io/kubectl:v1.36.1
+            script: |
+              #!/bin/sh
+              set -eu
+              job="camera-gateway-$(params.run-id)"
+              kubectl delete job "${job}" --namespace vault-tekton-demo --ignore-not-found
+              cat <<YAML | kubectl apply -f -
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                name: ${job}
+                namespace: vault-tekton-demo
+                labels:
+                  app: camera-gateway
+                  demo-run: "$(params.run-id)"
+              spec:
+                backoffLimit: 0
+                activeDeadlineSeconds: 180
+                template:
+                  metadata:
+                    labels:
+                      app: camera-gateway
+                      demo-run: "$(params.run-id)"
+                  spec:
+                    restartPolicy: Never
+                    serviceAccountName: camera-gateway
+                    automountServiceAccountToken: true
+                    securityContext:
+                      runAsNonRoot: true
+                    containers:
+                      - name: gateway
+                        image: $(params.gateway-image)
+                        imagePullPolicy: IfNotPresent
+                        env:
+                          - name: VAULT_ADDR
+                            value: http://vault.vault.svc:8200
+                          - name: VAULT_ROLE
+                            value: camera-gateway
+                          - name: VAULT_AWS_ROLE
+                            value: camera-uploader
+                          - name: AWS_REGION
+                            value: $(params.aws-region)
+                          - name: AWS_EC2_METADATA_DISABLED
+                            value: "true"
+                          - name: S3_BUCKET
+                            value: $(params.bucket)
+                          - name: RUN_ID
+                            value: "$(params.run-id)"
+                        volumeMounts:
+                          - name: event
+                            mountPath: /event
+                            readOnly: true
+                    volumes:
+                      - name: event
+                        configMap:
+                          name: synthetic-camera-event
+              YAML
+      params:
+        - name: aws-region
+          value: $(params.aws-region)
+        - name: bucket
+          value: $(params.bucket)
+        - name: gateway-image
+          value: $(params.gateway-image)
+        - name: run-id
+          value: $(params.run-id)
+
+    - name: verify-security-contract
+      runAfter: [deploy-gateway]
+      taskSpec:
+        params:
+          - name: run-id
+            type: string
+        steps:
+          - name: verify
+            image: registry.k8s.io/kubectl:v1.36.1
+            script: |
+              #!/bin/sh
+              set -eu
+              job="camera-gateway-$(params.run-id)"
+              kubectl wait --namespace vault-tekton-demo \
+                --for=condition=complete "job/${job}" --timeout=180s
+              logs="$(kubectl logs --namespace vault-tekton-demo "job/${job}" --container gateway)"
+              printf '%s\n' "${logs}"
+              printf '%s\n' "${logs}" | grep -F 'PROOF allowed PutObject inside events/*: PASS'
+              printf '%s\n' "${logs}" | grep -F 'PROOF denied PutObject outside events/*: PASS (AccessDenied)'
+              printf '%s\n' "${logs}" | grep -F 'PROOF denied GetObject read-back: PASS (AccessDenied)'
+              printf '%s\n' "${logs}" | grep -F 'AUDIT Lease TTL:'
+              echo 'PIPELINE RESULT: security contract verified'
+      params:
+        - name: run-id
+          value: $(params.run-id)
