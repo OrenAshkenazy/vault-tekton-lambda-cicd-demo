@@ -79,6 +79,7 @@ bootstrap_aws_and_vault() {
   use_demo_context
 
   local account_id bucket role_arn access_file access_key_id access_secret
+  local existing_access_key_ids existing_access_key_id
   account_id="$(aws sts get-caller-identity --region "${REGION}" --query Account --output text)"
   bucket="vault-tekton-demo-${account_id}-${REGION}"
 
@@ -90,15 +91,30 @@ bootstrap_aws_and_vault() {
     --capabilities CAPABILITY_NAMED_IAM
 
   role_arn="$(stack_output CameraUploaderRoleArn)"
+
+  existing_access_key_ids="$(aws iam list-access-keys \
+    --user-name "${BOOTSTRAP_USER}" \
+    --query 'AccessKeyMetadata[].AccessKeyId' \
+    --output text)"
+  for existing_access_key_id in ${existing_access_key_ids}; do
+    aws iam delete-access-key \
+      --user-name "${BOOTSTRAP_USER}" \
+      --access-key-id "${existing_access_key_id}"
+  done
+
   access_file="$(mktemp)"
   chmod 600 "${access_file}"
   access_key_id=""
 
   cleanup_unrotated_key() {
-    if [[ -n "${access_key_id}" ]]; then
+    local key_to_delete="${access_key_id}"
+    if [[ -z "${key_to_delete}" && -s "${access_file}" ]]; then
+      key_to_delete="$(jq -r '.AccessKey.AccessKeyId // empty' "${access_file}" 2>/dev/null || true)"
+    fi
+    if [[ -n "${key_to_delete}" ]]; then
       aws iam delete-access-key \
         --user-name "${BOOTSTRAP_USER}" \
-        --access-key-id "${access_key_id}" >/dev/null 2>&1 || true
+        --access-key-id "${key_to_delete}" >/dev/null 2>&1 || true
     fi
     rm -f "${access_file}"
   }
@@ -222,32 +238,37 @@ show_audit() {
   for tool in aws jq kubectl; do require "${tool}"; done
   use_demo_context
 
-  local role_arn job event
+  local role_arn job event gateway_logs assumed_role_arn role_session_name
   role_arn="$(stack_output CameraUploaderRoleArn)"
   job="$(kubectl get jobs --namespace "${NAMESPACE}" \
     --selector app=camera-gateway \
     --sort-by=.metadata.creationTimestamp \
     --output jsonpath='{.items[-1:].metadata.name}')"
 
+  gateway_logs="$(kubectl logs --namespace "${NAMESPACE}" "job/${job}" --container gateway)"
+  assumed_role_arn="$(sed -n 's/^AUDIT Vault returned: //p' <<<"${gateway_logs}" | tail -1)"
+  role_session_name="${assumed_role_arn##*/}"
+
   echo "Vault lease evidence (credentials are intentionally omitted):"
-  kubectl logs --namespace "${NAMESPACE}" "job/${job}" --container gateway |
-    grep -E '^(AUDIT|PROOF|RESULT)'
+  grep -E '^(AUDIT|PROOF|RESULT)' <<<"${gateway_logs}"
 
   event="$(aws cloudtrail lookup-events \
     --region "${REGION}" \
     --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRole \
     --max-results 50 \
     --output json |
-    jq -c --arg role "${role_arn}" '
+    jq -c --arg role "${role_arn}" --arg session "${role_session_name}" '
       [.Events[]
        | . + {detail: (.CloudTrailEvent | fromjson)}
-       | select(.detail.requestParameters.roleArn == $role)]
+       | select(
+           .detail.requestParameters.roleArn == $role
+           and .detail.requestParameters.roleSessionName == $session)]
       | sort_by(.EventTime)
       | reverse
       | .[0] // empty')"
 
   if [[ -z "${event}" ]]; then
-    echo "CloudTrail has not surfaced the AssumeRole event yet; rerun './demo.sh audit' in a few minutes."
+    echo "CloudTrail has not surfaced this run's AssumeRole session yet; rerun './demo.sh audit' in a few minutes."
     return 0
   fi
 

@@ -65,8 +65,9 @@ Show these beats in order:
 6. CloudTrail Event History shows Vault's `AssumeRole` call in `il-central-1`.
 
 CloudTrail management events can take a few minutes to appear. Run the demo once
-before the interview, then use the previous event as audit evidence if the new
-one has not surfaced yet. The audit command never displays AWS credentials.
+before the interview to measure that delay. During the presentation, `audit`
+matches the current Job's unique assumed-role session; wait and rerun it rather
+than substituting a stale event. The command never displays AWS credentials.
 
 The closing line is:
 

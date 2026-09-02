@@ -100,7 +100,7 @@ spec:
             type: string
         steps:
           - name: deploy
-            image: registry.k8s.io/kubectl:v1.36.1
+            image: $(params.gateway-image)
             script: |
               #!/bin/sh
               set -eu
@@ -173,15 +173,38 @@ spec:
         params:
           - name: run-id
             type: string
+          - name: gateway-image
+            type: string
         steps:
           - name: verify
-            image: registry.k8s.io/kubectl:v1.36.1
+            image: $(params.gateway-image)
             script: |
               #!/bin/sh
               set -eu
               job="camera-gateway-$(params.run-id)"
-              kubectl wait --namespace vault-tekton-demo \
-                --for=condition=complete "job/${job}" --timeout=180s
+              elapsed=0
+              complete=''
+              while [ "${elapsed}" -lt 180 ]; do
+                complete="$(kubectl get job "${job}" --namespace vault-tekton-demo \
+                  --output jsonpath='{.status.conditions[?(@.type=="Complete")].status}')"
+                failed="$(kubectl get job "${job}" --namespace vault-tekton-demo \
+                  --output jsonpath='{.status.conditions[?(@.type=="Failed")].status}')"
+                if [ "${complete}" = True ]; then
+                  break
+                fi
+                if [ "${failed}" = True ]; then
+                  kubectl logs --namespace vault-tekton-demo "job/${job}" --container gateway || true
+                  echo 'Gateway Job failed' >&2
+                  exit 1
+                fi
+                sleep 2
+                elapsed=$((elapsed + 2))
+              done
+              if [ "${complete}" != True ]; then
+                kubectl logs --namespace vault-tekton-demo "job/${job}" --container gateway || true
+                echo 'Gateway Job timed out' >&2
+                exit 1
+              fi
               logs="$(kubectl logs --namespace vault-tekton-demo "job/${job}" --container gateway)"
               printf '%s\n' "${logs}"
               printf '%s\n' "${logs}" | grep -F 'PROOF allowed PutObject inside events/*: PASS'
@@ -192,3 +215,5 @@ spec:
       params:
         - name: run-id
           value: $(params.run-id)
+        - name: gateway-image
+          value: $(params.gateway-image)

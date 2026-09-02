@@ -9,10 +9,13 @@ printf 'synthetic-token' >"${test_dir}/service-account-token"
 
 cat >"${test_dir}/bin/vault" <<'VAULT'
 #!/usr/bin/env bash
-if [[ "$1" == write ]]; then
+if [[ "$1" == write && "$2" == -format=json && "$3" == auth/kubernetes/login ]]; then
   printf '%s\n' '{"auth":{"client_token":"MOCK_VAULT_TOKEN"}}'
-else
+elif [[ "$1" == read && "$2" == -format=json && "$3" == aws/creds/camera-uploader ]]; then
   printf '%s\n' '{"lease_id":"aws/creds/camera-uploader/mock","lease_duration":900,"data":{"arn":"arn:aws:sts::123456789012:assumed-role/VaultTektonDemoCameraUploader/mock","access_key":"MOCK_ACCESS_KEY","secret_key":"MOCK_SECRET","security_token":"MOCK_SESSION"}}'
+else
+  echo "Unexpected Vault command: $*" >&2
+  exit 1
 fi
 VAULT
 
@@ -30,7 +33,11 @@ if [[ "$1 $2" == 's3api get-object' ]]; then
   echo 'An error occurred (AccessDenied)' >&2
   exit 254
 fi
-exit 0
+if [[ "$1 $2" == 's3api put-object' && "$*" == *'events/'* ]]; then
+  exit 0
+fi
+echo "Unexpected AWS command: $*" >&2
+exit 1
 AWS
 
 chmod +x "${test_dir}/bin/vault" "${test_dir}/bin/aws"
