@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+[[ -x /usr/local/bin/aws ]] && export PATH="/usr/local/bin:${PATH}"
+
 readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REGION=il-central-1
 readonly CLUSTER=vault-tekton-demo
