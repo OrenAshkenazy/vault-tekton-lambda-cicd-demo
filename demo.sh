@@ -11,6 +11,7 @@ readonly NAMESPACE=vault-tekton-demo
 readonly VAULT_NAMESPACE=vault
 readonly VAULT_ROOT_TOKEN=demo-root
 readonly STACK_NAME=vault-tekton-demo
+readonly PROCESSOR_STACK_NAME=vault-tekton-image-processor-demo
 readonly BOOTSTRAP_USER=vault-tekton-demo-bootstrap
 readonly IMAGE=vault-tekton-demo:local
 readonly TEKTON_VERSION=v1.15.0
@@ -73,6 +74,8 @@ install_local() {
     docker exec -i "${CLUSTER}-control-plane" \
       ctr --namespace k8s.io images import - >/dev/null
   kubectl apply --filename "${ROOT_DIR}/k8s/demo.yaml"
+  kubectl delete role/gateway-job-manager rolebinding/tekton-deployer \
+    --namespace "${NAMESPACE}" --ignore-not-found
   echo "Local platform ready: Tekton ${TEKTON_VERSION}, Vault chart ${VAULT_CHART_VERSION}"
 }
 
@@ -80,7 +83,7 @@ bootstrap_aws_and_vault() {
   for tool in aws jq kubectl; do require "${tool}"; done
   use_demo_context
 
-  local account_id bucket role_arn access_file access_key_id access_secret attempt
+  local account_id bucket camera_role_arn lambda_role_arn access_file access_key_id access_secret attempt
   local existing_access_key_ids existing_access_key_id
   account_id="$(aws sts get-caller-identity --region "${REGION}" --query Account --output text)"
   bucket="vault-tekton-demo-${account_id}-${REGION}"
@@ -92,7 +95,8 @@ bootstrap_aws_and_vault() {
     --parameter-overrides "BucketName=${bucket}" \
     --capabilities CAPABILITY_NAMED_IAM
 
-  role_arn="$(stack_output CameraUploaderRoleArn)"
+  camera_role_arn="$(stack_output CameraUploaderRoleArn)"
+  lambda_role_arn="$(stack_output LambdaDeployerRoleArn)"
 
   existing_access_key_ids="$(aws iam list-access-keys \
     --user-name "${BOOTSTRAP_USER}" \
@@ -160,11 +164,26 @@ path "aws/creds/camera-uploader" {
 }
 HCL
 
+  kubectl --namespace "${VAULT_NAMESPACE}" exec -i vault-0 -- \
+    env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN="${VAULT_ROOT_TOKEN}" \
+    vault policy write lambda-deployer - >/dev/null <<'HCL'
+path "aws/creds/lambda-deployer" {
+  capabilities = ["read"]
+}
+HCL
+
   vault_exec write auth/kubernetes/role/camera-gateway \
     bound_service_account_names=camera-gateway \
     bound_service_account_namespaces="${NAMESPACE}" \
     audience=https://kubernetes.default.svc.cluster.local \
     policies=camera-uploader \
+    ttl=5m >/dev/null
+
+  vault_exec write auth/kubernetes/role/tekton-lambda-deployer \
+    bound_service_account_names=tekton-deployer \
+    bound_service_account_namespaces="${NAMESPACE}" \
+    audience=https://kubernetes.default.svc.cluster.local \
+    policies=lambda-deployer \
     ttl=5m >/dev/null
 
   jq -n \
@@ -178,7 +197,13 @@ HCL
 
   vault_exec write aws/roles/camera-uploader \
     credential_type=assumed_role \
-    role_arns="${role_arn}" \
+    role_arns="${camera_role_arn}" \
+    default_sts_ttl=15m \
+    max_sts_ttl=15m >/dev/null
+
+  vault_exec write aws/roles/lambda-deployer \
+    credential_type=assumed_role \
+    role_arns="${lambda_role_arn}" \
     default_sts_ttl=15m \
     max_sts_ttl=15m >/dev/null
 
@@ -188,7 +213,7 @@ HCL
   rm -f "${access_file}"
   trap - EXIT
 
-  echo "Vault configured for ${role_arn} in ${REGION}"
+  echo "Vault configured for ${camera_role_arn} and ${lambda_role_arn} in ${REGION}"
   echo "Bootstrap key rotated: the surviving static secret is known only to Vault"
 }
 
@@ -196,8 +221,9 @@ run_demo() {
   for tool in aws jq kubectl; do require "${tool}"; done
   use_demo_context
 
-  local bucket run_id run_name status elapsed
+  local bucket deployment_bucket run_id run_name status elapsed
   bucket="$(stack_output BucketName)"
+  deployment_bucket="$(stack_output DeploymentBucketName)"
   run_id="$(date -u +%Y%m%d%H%M%S)"
 
   run_name="$(kubectl create --filename - --output jsonpath='{.metadata.name}' <<YAML
@@ -211,11 +237,16 @@ spec:
     name: onprem-vault-assumerole
   taskRunTemplate:
     serviceAccountName: tekton-deployer
+  taskRunSpecs:
+    - pipelineTaskName: edge-upload
+      serviceAccountName: camera-gateway
   params:
     - name: aws-region
       value: ${REGION}
     - name: bucket
       value: ${bucket}
+    - name: deployment-bucket
+      value: ${deployment_bucket}
     - name: gateway-image
       value: ${IMAGE}
     - name: run-id
@@ -225,7 +256,7 @@ YAML
   echo "PipelineRun: ${run_name}"
 
   elapsed=0
-  while (( elapsed < 300 )); do
+  while (( elapsed < 600 )); do
     status="$(kubectl get pipelinerun "${run_name}" --namespace "${NAMESPACE}" \
       --output jsonpath='{.status.conditions[0].status}' 2>/dev/null || true)"
     case "${status}" in
@@ -254,14 +285,19 @@ show_audit() {
   for tool in aws jq kubectl; do require "${tool}"; done
   use_demo_context
 
-  local role_arn job event gateway_logs assumed_role_arn role_session_name
+  local role_arn pipeline_run taskrun pod event gateway_logs assumed_role_arn role_session_name
   role_arn="$(stack_output CameraUploaderRoleArn)"
-  job="$(kubectl get jobs --namespace "${NAMESPACE}" \
-    --selector app=camera-gateway \
+  pipeline_run="$(kubectl get pipelineruns --namespace "${NAMESPACE}" \
     --sort-by=.metadata.creationTimestamp \
     --output jsonpath='{.items[-1:].metadata.name}')"
+  taskrun="$(kubectl get taskruns --namespace "${NAMESPACE}" \
+    --selector "tekton.dev/pipelineRun=${pipeline_run},tekton.dev/pipelineTask=edge-upload" \
+    --output jsonpath='{.items[0].metadata.name}')"
+  pod="$(kubectl get pods --namespace "${NAMESPACE}" \
+    --selector "tekton.dev/taskRun=${taskrun}" \
+    --output jsonpath='{.items[0].metadata.name}')"
 
-  gateway_logs="$(kubectl logs --namespace "${NAMESPACE}" "job/${job}" --container gateway)"
+  gateway_logs="$(kubectl logs --namespace "${NAMESPACE}" "${pod}" --container step-upload)"
   assumed_role_arn="$(sed -n 's/^AUDIT Vault returned: //p' <<<"${gateway_logs}" | tail -1)"
   role_session_name="${assumed_role_arn##*/}"
 
@@ -304,7 +340,11 @@ check_files() {
   require yq
   bash -n "${ROOT_DIR}/demo.sh" "${ROOT_DIR}/app/entrypoint.sh"
   "${ROOT_DIR}/test/entrypoint.sh"
-  yq eval-all '.' "${ROOT_DIR}/infra/aws.yaml" "${ROOT_DIR}/k8s/demo.yaml" >/dev/null
+  python3 "${ROOT_DIR}/test/handler.py"
+  yq eval-all '.' \
+    "${ROOT_DIR}/infra/aws.yaml" \
+    "${ROOT_DIR}/k8s/demo.yaml" \
+    "${ROOT_DIR}/processor/serverless.yml" >/dev/null
   if grep -RIE '(AKIA[0-9A-Z]{16}|aws_secret_access_key[[:space:]]*=)' \
     "${ROOT_DIR}" --exclude-dir=.git; then
     echo "Possible AWS credential found" >&2
@@ -316,10 +356,21 @@ check_files() {
 cleanup_demo() {
   for tool in aws jq; do require "${tool}"; done
 
-  local bucket access_key_ids
+  local bucket deployment_bucket access_key_ids
   bucket="$(stack_output BucketName 2>/dev/null || true)"
+  deployment_bucket="$(stack_output DeploymentBucketName 2>/dev/null || true)"
+  if aws cloudformation describe-stacks \
+    --region "${REGION}" \
+    --stack-name "${PROCESSOR_STACK_NAME}" >/dev/null 2>&1; then
+    aws cloudformation delete-stack --region "${REGION}" --stack-name "${PROCESSOR_STACK_NAME}"
+    aws cloudformation wait stack-delete-complete --region "${REGION}" --stack-name "${PROCESSOR_STACK_NAME}"
+  fi
+
   if [[ "${bucket}" == vault-tekton-demo-*-"${REGION}" ]]; then
-    aws s3 rm "s3://${bucket}/events/" --recursive --region "${REGION}"
+    aws s3 rm "s3://${bucket}/" --recursive --region "${REGION}"
+  fi
+  if [[ "${deployment_bucket}" == vault-tekton-demo-*-"${REGION}"-deployments ]]; then
+    aws s3 rm "s3://${deployment_bucket}/" --recursive --region "${REGION}"
   fi
 
   access_key_ids="$(aws iam list-access-keys \
@@ -338,7 +389,7 @@ cleanup_demo() {
   if command -v kind >/dev/null 2>&1 && kind get clusters | grep -Fxq "${CLUSTER}"; then
     kind delete cluster --name "${CLUSTER}"
   fi
-  echo "Deleted the demo bucket, Vault bootstrap principal, IAM role, stack, and local cluster."
+  echo "Deleted the Lambda processor, demo bucket, Vault bootstrap principal, IAM roles, stacks, and local cluster."
 }
 
 usage() {

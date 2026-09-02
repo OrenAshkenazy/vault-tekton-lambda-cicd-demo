@@ -9,8 +9,9 @@ set -euo pipefail
 : "${RUN_ID:?RUN_ID is required}"
 
 readonly service_account_token="${SERVICE_ACCOUNT_TOKEN_FILE:-/var/run/secrets/kubernetes.io/serviceaccount/token}"
-readonly allowed_key="events/${RUN_ID}.json"
-readonly denied_key="private/${RUN_ID}.json"
+readonly allowed_key="events/${RUN_ID}.svg"
+readonly denied_key="private/${RUN_ID}.svg"
+readonly camera_image=/event/camera-frame.svg
 
 cleanup() {
   unset VAULT_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
@@ -49,15 +50,17 @@ aws s3api put-object \
   --region "${AWS_REGION}" \
   --bucket "${S3_BUCKET}" \
   --key "${allowed_key}" \
-  --body /event/event.json >/dev/null
-echo "PROOF allowed PutObject inside events/*: PASS"
+  --body "${camera_image}" \
+  --content-type image/svg+xml >/dev/null
+echo "PROOF synthetic camera image uploaded to events/*: PASS"
 
 echo "4/6 Negative operation: PutObject outside events/*"
 if aws s3api put-object \
   --region "${AWS_REGION}" \
   --bucket "${S3_BUCKET}" \
   --key "${denied_key}" \
-  --body /event/event.json >/dev/null 2>/tmp/denied-put.log; then
+  --body "${camera_image}" \
+  --content-type image/svg+xml >/dev/null 2>/tmp/denied-put.log; then
   echo "PROOF denied PutObject outside events/*: FAIL (unexpectedly allowed)" >&2
   exit 1
 fi
@@ -69,7 +72,7 @@ if aws s3api get-object \
   --region "${AWS_REGION}" \
   --bucket "${S3_BUCKET}" \
   --key "${allowed_key}" \
-  /tmp/read-back.json >/dev/null 2>/tmp/denied-get.log; then
+  /tmp/read-back.svg >/dev/null 2>/tmp/denied-get.log; then
   echo "PROOF denied GetObject read-back: FAIL (unexpectedly allowed)" >&2
   exit 1
 fi

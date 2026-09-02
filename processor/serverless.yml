@@ -1,0 +1,40 @@
+service: vault-tekton-image-processor
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  region: ${env:AWS_REGION}
+  runtime: python3.11
+  stage: demo
+  stackName: vault-tekton-image-processor-demo
+  deploymentBucket:
+    name: ${env:DEPLOYMENT_BUCKET}
+    serverSideEncryption: AES256
+  iam:
+    role: ${env:LAMBDA_EXECUTION_ROLE_ARN}
+
+functions:
+  process-image:
+    name: vault-tekton-image-processor
+    handler: handler.lambda_handler
+    memorySize: 128
+    timeout: 10
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - aws.s3
+            detail-type:
+              - Object Created
+            detail:
+              bucket:
+                name:
+                  - ${env:S3_BUCKET}
+              object:
+                key:
+                  - prefix: events/
+
+package:
+  patterns:
+    - "!**"
+    - handler.py

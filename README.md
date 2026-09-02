@@ -1,15 +1,20 @@
 # Vault + Tekton AssumeRole demo
 
-This demo proves one security contract in AWS Region `us-east-1`:
+This demo proves two security contracts in AWS Region `us-east-1`:
 
-> A simulated on-prem camera gateway has no permanent AWS credential. It logs
-> into Vault, receives a leased STS credential for one IAM role, can write only
-> to `events/*`, and cannot write elsewhere or read the object back.
+> Tekton deploys an S3-triggered Lambda through Serverless Framework using a
+> short-lived Vault lease. A simulated on-prem camera gateway receives a
+> different leased role, uploads a synthetic image directly to `events/*`, and
+> cannot write elsewhere or read the image back.
 
 ## Flow
 
 ```text
-Tekton deploys a gateway Job
+Tekton logs into Vault as lambda-deployer
+        ↓
+Serverless Framework deploys the EventBridge-triggered Lambda
+        ↓
+Tekton deploys a simulated edge gateway Job
         ↓
 Job logs into Vault with its Kubernetes service-account token
         ↓
@@ -17,13 +22,20 @@ Vault AWS Secrets Engine calls STS AssumeRole
         ↓
 Job receives a 15-minute credential in memory
         ↓
-PutObject events/*       → allowed
+PutObject events/*.svg   → allowed
 PutObject private/*      → AccessDenied
 GetObject events/*       → AccessDenied
+        ↓
+S3 Object Created → EventBridge → Lambda → marker in CloudWatch Logs
 ```
 
-Tekton is the delivery and verification path. The gateway Job—not Tekton—uses
-Vault at runtime. There is no Vault Agent Injector.
+Tekton and the edge task use separate Kubernetes identities, Vault policies,
+and AWS roles. The Lambda execution role is pre-created, so the deployer may
+pass it but cannot rewrite it. The gateway can only write under `events/*`.
+Serverless artifacts use a separate bucket, so the deployer has no S3
+data-plane access to camera objects; it retains read-only processor-log access
+for pipeline verification. There is no Vault Agent Injector and no AWS
+credential is stored in a Kubernetes Secret.
 
 ## Prerequisites
 
@@ -32,7 +44,9 @@ Vault at runtime. There is no Vault Agent Injector.
 - Network access to AWS, GitHub-hosted Tekton manifests, Helm, and container registries
 
 The scripts pin Tekton `v1.15.0` LTS, Vault Helm chart `0.34.0`, Vault `2.0.3`,
-AWS CLI container `2.34.48`, kind node `1.36.1`, and Region `us-east-1`.
+Serverless Framework `3.40.0`, AWS CLI container `2.34.48`, kind node `1.36.1`,
+and Region `us-east-1`. Serverless v3 is pinned for this self-contained demo so
+the live pipeline does not depend on a separate Serverless Dashboard login.
 
 ## Prepare once
 
@@ -57,16 +71,17 @@ that identity to call `AssumeRole`; `cleanup` deletes it and its Vault-owned key
 
 Show these beats in order:
 
-1. The Tekton PipelineRun deploys the simulated on-prem gateway.
-2. Vault prints only its lease ID, 15-minute TTL, and assumed-role ARN.
-3. `PutObject` under `events/*` succeeds.
-4. `PutObject` under `private/*` returns `AccessDenied`.
-5. `GetObject` for the uploaded event returns `AccessDenied`.
-6. CloudTrail Event History shows Vault's `AssumeRole` call in `us-east-1`.
+1. Tekton obtains the `lambda-deployer` lease and runs `serverless deploy`.
+2. Tekton runs the simulated on-prem edge task under a different service account.
+3. The gateway obtains a `camera-uploader` lease and uploads a synthetic SVG image directly to `events/*`.
+4. `PutObject` under `private/*` returns `AccessDenied` with the same credentials.
+5. `GetObject` for the uploaded image returns `AccessDenied`.
+6. S3 emits the object event through EventBridge; Tekton finds the Lambda marker in CloudWatch Logs.
+7. CloudTrail Event History shows Vault's exact `AssumeRole` session in `us-east-1`.
 
 CloudTrail management events can take a few minutes to appear. Run the demo once
 before the interview to measure that delay. During the presentation, `audit`
-matches the current Job's unique assumed-role session; wait and rerun it rather
+matches the current edge task's unique assumed-role session; wait and rerun it rather
 than substituting a stale event. The command never displays AWS credentials.
 
 The closing line is:
@@ -79,5 +94,6 @@ The closing line is:
 ./demo.sh cleanup
 ```
 
-This empties the dedicated bucket, deletes all access keys for the demo bootstrap
-user, deletes the CloudFormation stack, and deletes the dedicated kind cluster.
+This empties both dedicated buckets, deletes all access keys for the demo
+bootstrap user, deletes both CloudFormation stacks, and deletes the dedicated
+kind cluster.

@@ -33,7 +33,10 @@ if [[ "$1 $2" == 's3api get-object' ]]; then
   echo 'An error occurred (AccessDenied)' >&2
   exit 254
 fi
-if [[ "$1 $2" == 's3api put-object' && "$*" == *'events/'* ]]; then
+if [[ "$1 $2" == 's3api put-object' \
+  && "$*" == *'--key events/test.svg'* \
+  && "$*" == *'--body /event/camera-frame.svg'* \
+  && "$*" == *'--content-type image/svg+xml'* ]]; then
   exit 0
 fi
 echo "Unexpected AWS command: $*" >&2
@@ -54,7 +57,7 @@ output="$(
   "${root_dir}/app/entrypoint.sh"
 )"
 
-grep -Fq 'PROOF allowed PutObject inside events/*: PASS' <<<"${output}"
+grep -Fq 'PROOF synthetic camera image uploaded to events/*: PASS' <<<"${output}"
 grep -Fq 'PROOF denied PutObject outside events/*: PASS (AccessDenied)' <<<"${output}"
 grep -Fq 'PROOF denied GetObject read-back: PASS (AccessDenied)' <<<"${output}"
 grep -Fq 'AUDIT Lease TTL: 900s' <<<"${output}"
