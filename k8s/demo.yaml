@@ -78,7 +78,7 @@ spec:
   params:
     - name: aws-region
       type: string
-      default: il-central-1
+      default: us-east-1
     - name: bucket
       type: string
     - name: gateway-image

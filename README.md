@@ -1,6 +1,6 @@
 # Vault + Tekton AssumeRole demo
 
-This demo proves one security contract in AWS Region `il-central-1`:
+This demo proves one security contract in AWS Region `us-east-1`:
 
 > A simulated on-prem camera gateway has no permanent AWS credential. It logs
 > into Vault, receives a leased STS credential for one IAM role, can write only
@@ -32,7 +32,7 @@ Vault at runtime. There is no Vault Agent Injector.
 - Network access to AWS, GitHub-hosted Tekton manifests, Helm, and container registries
 
 The scripts pin Tekton `v1.15.0` LTS, Vault Helm chart `0.34.0`, Vault `2.0.3`,
-AWS CLI container `2.34.48`, kind node `1.36.1`, and Region `il-central-1`.
+AWS CLI container `2.34.48`, kind node `1.36.1`, and Region `us-east-1`.
 
 ## Prepare once
 
@@ -62,7 +62,7 @@ Show these beats in order:
 3. `PutObject` under `events/*` succeeds.
 4. `PutObject` under `private/*` returns `AccessDenied`.
 5. `GetObject` for the uploaded event returns `AccessDenied`.
-6. CloudTrail Event History shows Vault's `AssumeRole` call in `il-central-1`.
+6. CloudTrail Event History shows Vault's `AssumeRole` call in `us-east-1`.
 
 CloudTrail management events can take a few minutes to appear. Run the demo once
 before the interview to measure that delay. During the presentation, `audit`

@@ -48,8 +48,8 @@ output="$(
   VAULT_ADDR=http://vault.test:8200 \
   VAULT_ROLE=camera-gateway \
   VAULT_AWS_ROLE=camera-uploader \
-  S3_BUCKET=vault-tekton-demo-test-il-central-1 \
-  AWS_REGION=il-central-1 \
+  S3_BUCKET=vault-tekton-demo-test-us-east-1 \
+  AWS_REGION=us-east-1 \
   RUN_ID=test \
   "${root_dir}/app/entrypoint.sh"
 )"

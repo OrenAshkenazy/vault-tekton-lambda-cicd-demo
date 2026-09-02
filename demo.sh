@@ -4,7 +4,7 @@ set -euo pipefail
 [[ -x /usr/local/bin/aws ]] && export PATH="/usr/local/bin:${PATH}"
 
 readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly REGION=il-central-1
+readonly REGION=us-east-1
 readonly CLUSTER=vault-tekton-demo
 readonly CONTEXT="kind-${CLUSTER}"
 readonly NAMESPACE=vault-tekton-demo
@@ -80,7 +80,7 @@ bootstrap_aws_and_vault() {
   for tool in aws jq kubectl; do require "${tool}"; done
   use_demo_context
 
-  local account_id bucket role_arn access_file access_key_id access_secret
+  local account_id bucket role_arn access_file access_key_id access_secret attempt
   local existing_access_key_ids existing_access_key_id
   account_id="$(aws sts get-caller-identity --region "${REGION}" --query Account --output text)"
   bucket="vault-tekton-demo-${account_id}-${REGION}"
@@ -127,6 +127,20 @@ bootstrap_aws_and_vault() {
     --output json >"${access_file}"
   access_key_id="$(jq -er '.AccessKey.AccessKeyId' "${access_file}")"
   access_secret="$(jq -er '.AccessKey.SecretAccessKey' "${access_file}")"
+
+  for ((attempt = 1; attempt <= 12; attempt++)); do
+    if AWS_ACCESS_KEY_ID="${access_key_id}" \
+      AWS_SECRET_ACCESS_KEY="${access_secret}" \
+      AWS_SESSION_TOKEN= \
+      aws iam get-user --user-name "${BOOTSTRAP_USER}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 5
+  done
+  if ((attempt > 12)); then
+    echo "Bootstrap access key did not become usable within 60 seconds" >&2
+    return 1
+  fi
 
   if ! vault_exec secrets list -format=json | jq -e 'has("aws/")' >/dev/null; then
     vault_exec secrets enable aws >/dev/null
