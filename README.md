@@ -80,6 +80,9 @@ in the `lambda-cicd-config` ConfigMap. AWS credentials are never stored there.
 
 ## How the deployment Task authenticates
 
+For a shorter visual explanation, see
+[Authentication flow: the ADHD-friendly version](AUTH-FLOW.md).
+
 All Task Pods use the token-disabled service account `tekton-ci`. The Pipeline
 explicitly projects a ten-minute, Vault-audience JWT into the deployment step
 only; fetch and test receive no service-account token. The file is mounted at:
