@@ -6,13 +6,14 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: camera-gateway
+  name: tekton-ci
   namespace: vault-tekton-demo
+automountServiceAccountToken: false
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: tekton-deployer
+  name: github-trigger
   namespace: vault-tekton-demo
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -28,229 +29,243 @@ roleRef:
   kind: ClusterRole
   name: system:auth-delegator
 ---
-apiVersion: v1
-kind: ConfigMap
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
 metadata:
-  name: synthetic-camera-image
+  name: github-trigger-eventlistener
   namespace: vault-tekton-demo
-data:
-  camera-frame.svg: |
-    <svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
-      <rect width="640" height="360" fill="#111827"/>
-      <rect x="22" y="22" width="596" height="316" rx="8" fill="#1f2937" stroke="#22d3ee" stroke-width="3"/>
-      <path d="M90 245 L190 145 L275 230 L360 125 L535 285 H90 Z" fill="#374151"/>
-      <circle cx="500" cy="92" r="30" fill="#f59e0b"/>
-      <text x="48" y="72" fill="#f9fafb" font-family="monospace" font-size="26">CAMERA EDGE-01</text>
-      <text x="48" y="315" fill="#22d3ee" font-family="monospace" font-size="22">SYNTHETIC IMAGE - NO PERSON DATA</text>
-    </svg>
+subjects:
+  - kind: ServiceAccount
+    name: github-trigger
+    namespace: vault-tekton-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tekton-triggers-eventlistener-roles
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: github-trigger-eventlistener
+subjects:
+  - kind: ServiceAccount
+    name: github-trigger
+    namespace: vault-tekton-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tekton-triggers-eventlistener-clusterroles
 ---
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
-  name: onprem-vault-assumerole
+  name: lambda-cicd
   namespace: vault-tekton-demo
 spec:
   params:
-    - name: aws-region
+    - name: git-url
       type: string
-      default: us-east-1
-    - name: bucket
+    - name: git-revision
       type: string
-    - name: deployment-bucket
-      type: string
-    - name: gateway-image
-      type: string
-      default: vault-tekton-demo:local
-    - name: run-id
-      type: string
+  workspaces:
+    - name: source
   tasks:
-    - name: deploy-image-processor
+    - name: fetch-source
       taskSpec:
         params:
-          - name: aws-region
+          - name: git-url
             type: string
-          - name: bucket
+          - name: git-revision
             type: string
-          - name: deployment-bucket
-            type: string
-          - name: deploy-image
-            type: string
+        workspaces:
+          - name: source
         steps:
-          - name: serverless-deploy
-            image: $(params.deploy-image)
+          - name: clone
+            image: vault-tekton-demo:local
+            env:
+              - name: GIT_TERMINAL_PROMPT
+                value: "0"
+              - name: GIT_URL
+                value: $(params.git-url)
+              - name: GIT_REVISION
+                value: $(params.git-revision)
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+              [[ "${GIT_REVISION}" =~ ^[0-9a-f]{40}$ ]]
+              repo_dir="$(workspaces.source.path)/repo"
+              git init "${repo_dir}"
+              git -C "${repo_dir}" remote add origin "${GIT_URL}"
+              git -C "${repo_dir}" fetch --depth=1 origin "${GIT_REVISION}"
+              git -C "${repo_dir}" checkout --detach FETCH_HEAD
+              actual_revision="$(git -C "${repo_dir}" rev-parse HEAD)"
+              [[ "${actual_revision}" == "${GIT_REVISION}" ]]
+              printf 'PROOF checked out Git revision %s: PASS\n' "${actual_revision}"
+      params:
+        - name: git-url
+          value: $(params.git-url)
+        - name: git-revision
+          value: $(params.git-revision)
+      workspaces:
+        - name: source
+          workspace: source
+
+    - name: test-lambda
+      runAfter: [fetch-source]
+      taskSpec:
+        workspaces:
+          - name: source
+        steps:
+          - name: test
+            image: vault-tekton-demo:local
+            workingDir: $(workspaces.source.path)/repo
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+              python3 test/handler.py
+              ./test/deploy.sh
+              echo 'PROOF Lambda CI checks: PASS'
+      workspaces:
+        - name: source
+          workspace: source
+
+    - name: deploy-and-verify
+      runAfter: [test-lambda]
+      taskSpec:
+        params:
+          - name: git-revision
+            type: string
+        workspaces:
+          - name: source
+        volumes:
+          - name: vault-jwt
+            projected:
+              sources:
+                - serviceAccountToken:
+                    path: token
+                    audience: vault
+                    expirationSeconds: 600
+        steps:
+          - name: deploy
+            image: vault-tekton-demo:local
+            volumeMounts:
+              - name: vault-jwt
+                mountPath: /var/run/secrets/vault
+                readOnly: true
             env:
               - name: AWS_EC2_METADATA_DISABLED
                 value: "true"
-              - name: AWS_REGION
-                value: $(params.aws-region)
-              - name: S3_BUCKET
-                value: $(params.bucket)
-              - name: DEPLOYMENT_BUCKET
-                value: $(params.deployment-bucket)
               - name: SLS_TELEMETRY_DISABLED
                 value: "1"
               - name: VAULT_ADDR
                 value: http://vault.vault.svc:8200
-            script: |
-              #!/bin/sh
-              set -eu
-              cleanup() {
-                unset VAULT_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-              }
-              trap cleanup EXIT
-
-              login_json="$(vault write -format=json auth/kubernetes/login \
-                role=tekton-lambda-deployer \
-                jwt=@/var/run/secrets/kubernetes.io/serviceaccount/token)"
-              export VAULT_TOKEN="$(printf '%s' "${login_json}" | jq -er '.auth.client_token')"
-              unset login_json
-
-              credentials_json="$(vault read -format=json aws/creds/lambda-deployer)"
-              lease_id="$(printf '%s' "${credentials_json}" | jq -er '.lease_id')"
-              lease_ttl="$(printf '%s' "${credentials_json}" | jq -er '.lease_duration')"
-              assumed_role_arn="$(printf '%s' "${credentials_json}" | jq -er '.data.arn')"
-              export AWS_ACCESS_KEY_ID="$(printf '%s' "${credentials_json}" | jq -er '.data.access_key')"
-              export AWS_SECRET_ACCESS_KEY="$(printf '%s' "${credentials_json}" | jq -er '.data.secret_key')"
-              export AWS_SESSION_TOKEN="$(printf '%s' "${credentials_json}" | jq -er '.data.security_token // .data.session_token')"
-              unset credentials_json VAULT_TOKEN
-
-              printf 'AUDIT Deploy Vault lease: %s\n' "${lease_id}"
-              printf 'AUDIT Deploy lease TTL: %ss\n' "${lease_ttl}"
-              printf 'AUDIT Deploy Vault returned: %s\n' "${assumed_role_arn}"
-              caller_json="$(aws sts get-caller-identity --region "${AWS_REGION}" --output json)"
-              caller_arn="$(printf '%s' "${caller_json}" | jq -er '.Arn')"
-              account_id="$(printf '%s' "${caller_json}" | jq -er '.Account')"
-              unset caller_json
-              export LAMBDA_EXECUTION_ROLE_ARN="arn:aws:iam::${account_id}:role/VaultTektonDemoImageProcessorExecutionRole"
-              printf 'AUDIT Deploy AWS caller: %s\n' "${caller_arn}"
-
-              cp -R /opt/image-processor /tmp/image-processor
-              cd /tmp/image-processor
-              serverless deploy
-              echo 'PROOF Tekton deployed the Lambda through Serverless Framework: PASS'
-      params:
-        - name: aws-region
-          value: $(params.aws-region)
-        - name: bucket
-          value: $(params.bucket)
-        - name: deployment-bucket
-          value: $(params.deployment-bucket)
-        - name: deploy-image
-          value: $(params.gateway-image)
-
-    - name: edge-upload
-      runAfter: [deploy-image-processor]
-      taskSpec:
-        params:
-          - name: aws-region
-            type: string
-          - name: bucket
-            type: string
-          - name: gateway-image
-            type: string
-          - name: run-id
-            type: string
-        steps:
-          - name: upload
-            image: $(params.gateway-image)
-            env:
-              - name: VAULT_ADDR
-                value: http://vault.vault.svc:8200
-              - name: VAULT_ROLE
-                value: camera-gateway
-              - name: VAULT_AWS_ROLE
-                value: camera-uploader
+              - name: SERVICE_ACCOUNT_TOKEN_FILE
+                value: /var/run/secrets/vault/token
               - name: AWS_REGION
-                value: $(params.aws-region)
-              - name: AWS_EC2_METADATA_DISABLED
-                value: "true"
-              - name: S3_BUCKET
-                value: $(params.bucket)
-              - name: RUN_ID
-                value: $(params.run-id)
-            volumeMounts:
-              - name: camera-image
-                mountPath: /event
-                readOnly: true
+                valueFrom:
+                  configMapKeyRef:
+                    name: lambda-cicd-config
+                    key: aws-region
+              - name: DEPLOYMENT_BUCKET
+                valueFrom:
+                  configMapKeyRef:
+                    name: lambda-cicd-config
+                    key: deployment-bucket
+              - name: LAMBDA_EXECUTION_ROLE_ARN
+                valueFrom:
+                  configMapKeyRef:
+                    name: lambda-cicd-config
+                    key: lambda-execution-role-arn
+              - name: SOURCE_DIR
+                value: $(workspaces.source.path)/repo
+              - name: SERVERLESS_TEMPLATE
+                value: /opt/lambda-template/serverless.yml
+              - name: GIT_SHA
+                value: $(params.git-revision)
             script: |
-              #!/bin/sh
-              exec /usr/local/bin/gateway-demo
-        volumes:
-          - name: camera-image
-            configMap:
-              name: synthetic-camera-image
+              #!/bin/bash
+              set -euo pipefail
+              /usr/local/bin/deploy-lambda
       params:
-        - name: aws-region
-          value: $(params.aws-region)
-        - name: bucket
-          value: $(params.bucket)
-        - name: gateway-image
-          value: $(params.gateway-image)
-        - name: run-id
-          value: $(params.run-id)
-
-    - name: verify-image-processing
-      runAfter: [edge-upload]
-      taskSpec:
+        - name: git-revision
+          value: $(params.git-revision)
+      workspaces:
+        - name: source
+          workspace: source
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: github-release
+  namespace: vault-tekton-demo
+spec:
+  params:
+    - name: git-url
+      value: https://github.com/OrenAshkenazy/vault-tekton-lambda-cicd-demo.git
+    - name: git-revision
+      value: $(body.after)
+    - name: git-ref
+      value: $(body.ref)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: lambda-cicd
+  namespace: vault-tekton-demo
+spec:
+  params:
+    - name: git-url
+    - name: git-revision
+    - name: git-ref
+  resourceTemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: lambda-cicd-
+        namespace: vault-tekton-demo
+        labels:
+          app.kubernetes.io/part-of: vault-tekton-lambda-cicd
+          demo.git.sha: $(tt.params.git-revision)
+        annotations:
+          demo.git.ref: $(tt.params.git-ref)
+      spec:
+        pipelineRef:
+          name: lambda-cicd
+        taskRunTemplate:
+          serviceAccountName: tekton-ci
         params:
-          - name: aws-region
-            type: string
-          - name: run-id
-            type: string
-          - name: verify-image
-            type: string
-        steps:
-          - name: verify-lambda
-            image: $(params.verify-image)
-            env:
-              - name: AWS_EC2_METADATA_DISABLED
-                value: "true"
-              - name: AWS_REGION
-                value: $(params.aws-region)
-              - name: VAULT_ADDR
-                value: http://vault.vault.svc:8200
-            script: |
-              #!/bin/sh
-              set -eu
-              cleanup() {
-                unset VAULT_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-              }
-              trap cleanup EXIT
-
-              login_json="$(vault write -format=json auth/kubernetes/login \
-                role=tekton-lambda-deployer \
-                jwt=@/var/run/secrets/kubernetes.io/serviceaccount/token)"
-              export VAULT_TOKEN="$(printf '%s' "${login_json}" | jq -er '.auth.client_token')"
-              unset login_json
-              credentials_json="$(vault read -format=json aws/creds/lambda-deployer)"
-              export AWS_ACCESS_KEY_ID="$(printf '%s' "${credentials_json}" | jq -er '.data.access_key')"
-              export AWS_SECRET_ACCESS_KEY="$(printf '%s' "${credentials_json}" | jq -er '.data.secret_key')"
-              export AWS_SESSION_TOKEN="$(printf '%s' "${credentials_json}" | jq -er '.data.security_token // .data.session_token')"
-              unset credentials_json VAULT_TOKEN
-
-              start_ms="$((($(date +%s) - 300) * 1000))"
-              elapsed=0
-              while [ "${elapsed}" -lt 120 ]; do
-                events="$(aws logs filter-log-events \
-                  --region "${AWS_REGION}" \
-                  --log-group-name /aws/lambda/vault-tekton-image-processor \
-                  --start-time "${start_ms}" \
-                  --query 'events[].message' \
-                  --output text 2>/dev/null || true)"
-                if printf '%s\n' "${events}" | grep -Fq "events/$(params.run-id).svg"; then
-                  printf '%s\n' "${events}" | grep -F "events/$(params.run-id).svg" | tail -1
-                  echo 'PROOF Lambda processed the S3 image event: PASS'
-                  exit 0
-                fi
-                sleep 2
-                elapsed=$((elapsed + 2))
-              done
-              echo 'Lambda processing evidence did not appear within 120 seconds' >&2
-              exit 1
-      params:
-        - name: aws-region
-          value: $(params.aws-region)
-        - name: run-id
-          value: $(params.run-id)
-        - name: verify-image
-          value: $(params.gateway-image)
+          - name: git-url
+            value: $(tt.params.git-url)
+          - name: git-revision
+            value: $(tt.params.git-revision)
+        workspaces:
+          - name: source
+            volumeClaimTemplate:
+              spec:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: 100Mi
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: github-release
+  namespace: vault-tekton-demo
+spec:
+  serviceAccountName: github-trigger
+  triggers:
+    - name: demo-tag
+      interceptors:
+        - ref:
+            name: cel
+          params:
+            - name: filter
+              value: >-
+                header.match('X-GitHub-Event', 'push') &&
+                body.ref.startsWith('refs/tags/demo-') &&
+                body.repository.full_name == 'OrenAshkenazy/vault-tekton-lambda-cicd-demo'
+      bindings:
+        - ref: github-release
+      template:
+        ref: lambda-cicd

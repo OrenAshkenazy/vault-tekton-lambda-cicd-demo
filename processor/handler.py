@@ -1,6 +1,8 @@
-def lambda_handler(event, _context):
-    detail = event["detail"]
-    bucket = detail["bucket"]["name"]
-    image = detail["object"]
-    print(f"PROCESSED s3://{bucket}/{image['key']} size={image['size']}")
-    return {"processed": 1}
+import os
+
+
+def lambda_handler(_event, _context):
+    return {
+        "message": "Lambda deployed by Tekton with Vault credentials",
+        "gitSha": os.environ["DEPLOYMENT_SHA"],
+    }

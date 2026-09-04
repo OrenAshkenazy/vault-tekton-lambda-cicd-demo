@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-import contextlib
 import importlib.util
-import io
+import os
 import sys
 from pathlib import Path
 
@@ -12,16 +11,11 @@ spec = importlib.util.spec_from_file_location("handler", handler_path)
 handler = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(handler)
 
-event = {
-    "detail": {
-        "bucket": {"name": "demo-bucket"},
-        "object": {"key": "events/camera-frame.svg", "size": 1234},
-    }
-}
-output = io.StringIO()
-with contextlib.redirect_stdout(output):
-    result = handler.lambda_handler(event, None)
+os.environ["DEPLOYMENT_SHA"] = "a1b2c3d"
+result = handler.lambda_handler({}, None)
 
-assert result == {"processed": 1}
-assert "PROCESSED s3://demo-bucket/events/camera-frame.svg size=1234" in output.getvalue()
+assert result == {
+    "message": "Lambda deployed by Tekton with Vault credentials",
+    "gitSha": "a1b2c3d",
+}
 print("Lambda handler checks passed")

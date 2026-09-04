@@ -1,4 +1,4 @@
-service: vault-tekton-image-processor
+service: vault-tekton-lambda-cicd
 frameworkVersion: "3"
 
 provider:
@@ -6,33 +6,21 @@ provider:
   region: ${env:AWS_REGION}
   runtime: python3.11
   stage: demo
-  stackName: vault-tekton-image-processor-demo
+  stackName: vault-tekton-lambda-cicd-demo
   deploymentBucket:
     name: ${env:DEPLOYMENT_BUCKET}
     serverSideEncryption: AES256
   iam:
     role: ${env:LAMBDA_EXECUTION_ROLE_ARN}
+  environment:
+    DEPLOYMENT_SHA: ${env:DEPLOYMENT_SHA}
 
 functions:
-  process-image:
-    name: vault-tekton-image-processor
+  version:
+    name: vault-tekton-lambda-cicd
     handler: handler.lambda_handler
     memorySize: 128
     timeout: 10
-    events:
-      - eventBridge:
-          pattern:
-            source:
-              - aws.s3
-            detail-type:
-              - Object Created
-            detail:
-              bucket:
-                name:
-                  - ${env:S3_BUCKET}
-              object:
-                key:
-                  - prefix: events/
 
 package:
   patterns:

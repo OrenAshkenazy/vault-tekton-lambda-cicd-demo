@@ -1,213 +1,210 @@
-# Vault + Tekton AssumeRole demo
+# GitHub → Tekton → Vault → AWS Lambda CI/CD demo
 
-This demo proves two security contracts in AWS Region `us-east-1`:
-
-> Tekton deploys an S3-triggered Lambda through Serverless Framework using a
-> short-lived Vault lease. A simulated on-prem camera gateway receives a
-> different leased role, uploads a synthetic image directly to `events/*`, and
-> cannot write elsewhere or read the image back.
-
-## Flow
+This demo follows one Lambda revision from a GitHub release tag to AWS without
+storing AWS credentials in GitHub or Kubernetes:
 
 ```text
-Tekton logs into Vault as lambda-deployer
+GitHub demo-* tag
         ↓
-Serverless Framework deploys the EventBridge-triggered Lambda
+Tekton EventListener → TriggerBinding → TriggerTemplate
         ↓
-Tekton runs a simulated edge task as camera-gateway
+PipelineRun clones the exact commit
         ↓
-The task logs into Vault with its Kubernetes service-account token
+Lambda and deployment-security tests
         ↓
-Vault AWS Secrets Engine calls STS AssumeRole
+Kubernetes service-account JWT → Vault Kubernetes auth
         ↓
-The task receives a 15-minute credential in memory
+Vault AWS Secrets Engine → 15-minute STS AssumeRole credentials
         ↓
-PutObject events/*.svg   → allowed
-PutObject private/*      → AccessDenied
-GetObject events/*       → AccessDenied
+Serverless Framework → CloudFormation → Lambda
         ↓
-S3 Object Created → EventBridge → Lambda → marker in CloudWatch Logs
+Lambda response contains the same Git SHA
+        ↓
+CloudTrail proves the exact AssumeRole session
 ```
 
-Tekton and the edge task use separate Kubernetes identities, Vault policies,
-and AWS roles. The Lambda execution role is pre-created, so the deployer may
-pass it but cannot rewrite it. The gateway can only write under `events/*`.
-Serverless artifacts use a separate bucket, so the deployer has no S3
-data-plane access to camera objects; it retains read-only processor-log access
-for pipeline verification. There is no Vault Agent Injector and no AWS
-credential is stored in a Kubernetes Secret.
+The live pipeline contains only three Tasks: `fetch-source`, `test-lambda`, and
+`deploy-and-verify`. The final Task also proves that its deployment role cannot
+enumerate IAM users. Credentials exist only in that Task's process memory and
+are cleared when it exits. Its deploy script and Serverless template come from
+the pinned tool image; only the tested Lambda handler comes from the Git commit.
+
+## Scope
+
+Included:
+
+- a real GitHub `push` event for a `demo-*` tag;
+- Tekton Triggers and a read-only Tekton Dashboard;
+- Lambda CI tests and Serverless Framework deployment;
+- direct Kubernetes-to-Vault authentication;
+- a leased AWS `AssumeRole` credential;
+- deployed Git revision verification and CloudTrail evidence.
+
+Not included: camera ingestion, image recognition, EventBridge, a Vault Agent
+Injector, GitHub Actions, or any AWS credential stored as a Kubernetes Secret.
 
 ## Prerequisites
 
-- Docker, `kind`, `kubectl`, Helm, AWS CLI, `jq`, and `yq`
-- An AWS sandbox identity allowed to deploy CloudFormation, IAM, and S3
-- Network access to AWS, GitHub-hosted Tekton manifests, Helm, and container registries
+- Docker, `kind`, `kubectl`, Helm, AWS CLI, `jq`, `yq`, Git, and GitHub CLI
+- a public GitHub repository containing this project
+- an AWS sandbox identity allowed to deploy CloudFormation, IAM, S3, and Lambda
+- Region `us-east-1`
 
-The scripts pin Tekton `v1.15.0` LTS, Vault Helm chart `0.34.0`, Vault `2.0.3`,
-Serverless Framework `3.40.0`, AWS CLI container `2.34.48`, kind node `1.36.1`,
-and Region `us-east-1`. Serverless v3 is pinned for this self-contained demo so
-the live pipeline does not depend on a separate Serverless Dashboard login.
+The lab pins Tekton Pipelines `v1.15.0`, Tekton Triggers `v0.37.0`, Tekton
+Dashboard `v0.72.0`, Vault chart `0.34.0` / Vault `2.0.3`, Serverless Framework
+`3.40.0`, and kind node `1.36.1`.
 
 ## Prepare once
 
+Load a current AWS sandbox session, then run:
+
 ```bash
 ./demo.sh check
-./demo.sh install
-./demo.sh bootstrap
+./demo.sh prepare
 ```
 
-`bootstrap` creates a dedicated IAM user long enough to configure the Vault AWS
-Secrets Engine. It immediately calls Vault's `rotate-root`, deleting the key
-seen by the setup process and replacing it with one known only to Vault. The
-bootstrap principal itself remains until the demo ends because Vault still needs
-that identity to call `AssumeRole`; `cleanup` deletes it and its Vault-owned key.
+`prepare` creates the local kind cluster, installs Tekton, its read-only
+Dashboard, and Vault, then deploys the AWS foundation. The foundation contains:
 
-## Tekton Dashboard
+- one encrypted, private S3 bucket for Serverless deployment artifacts;
+- one pre-created Lambda execution role;
+- one least-privilege Lambda deployment role;
+- one bootstrap principal used only to configure Vault's AWS Secrets Engine.
 
-The Dashboard is optional and is not installed by `demo.sh`. Dashboard `v0.72.0`
-supports the pinned Pipelines `v1.15.x`. Install its read-only release:
+Vault immediately runs `aws/config/rotate-root`, deleting the access key seen
+by the setup process and replacing it with one known only to Vault. Cleanup
+deletes the remaining bootstrap principal and its Vault-owned key.
 
-```bash
-kubectl apply --filename \
-  https://infra.tekton.dev/tekton-releases/dashboard/previous/v0.72.0/release.yaml
-kubectl wait --namespace tekton-pipelines \
-  --for=condition=available deployment/tekton-dashboard --timeout=180s
+The generated bucket name and execution-role ARN are non-secret values stored
+in the `lambda-cicd-config` ConfigMap. AWS credentials are never stored there.
+
+## How the deployment Task authenticates
+
+All Task Pods use the token-disabled service account `tekton-ci`. The Pipeline
+explicitly projects a ten-minute, Vault-audience JWT into the deployment step
+only; fetch and test receive no service-account token. The file is mounted at:
+
+```text
+/var/run/secrets/vault/token
 ```
 
-Expose it only on the local machine:
+The deployment script passes that file directly to Vault:
 
 ```bash
-kubectl --namespace tekton-pipelines \
-  port-forward service/tekton-dashboard 9097:9097
+vault write -format=json auth/kubernetes/login \
+  role=tekton-lambda-deployer \
+  jwt=@/var/run/secrets/vault/token
 ```
 
-Open <http://127.0.0.1:9097>, select namespace `vault-tekton-demo`, and open
-the latest `onprem-vault-assumerole-*` PipelineRun. There is no Dashboard
-username or password. A Kubernetes context is required to start the local
-port-forward, but any process or user on that workstation can then reach the
-Dashboard and its logs. Run it only on a trusted single-user workstation and
-stop it with `Ctrl-C` immediately after the demo.
+Vault asks the Kubernetes TokenReview API to validate the JWT, then checks that
+it has audience `vault` and belongs to service account `tekton-ci` in namespace
+`vault-tekton-demo`. A successful login receives a five-minute Vault token with
+permission to read only:
 
-## Get fresh AWS credentials through Vault
+```text
+aws/creds/lambda-deployer
+```
 
-Vault exposes two dynamic AWS roles. Each read creates a fresh STS
-`AssumeRole` session. The Tekton PipelineRun uses both: its deployment tasks
-use `lambda-deployer`, while its simulated edge task uses `camera-uploader`.
-No AWS credential is stored in a Kubernetes Secret.
+That read makes Vault call AWS STS `AssumeRole` and return a 15-minute access
+key, secret key, and session token. The script exports all three in memory,
+unsets the Vault token, deploys, invokes Lambda, and clears the AWS values on
+exit. Logs show the lease ID, TTL, and assumed-role ARN—never credential values.
 
-| Purpose | Kubernetes service account | Vault login role | Credentials path |
-| --- | --- | --- | --- |
-| Edge upload | `camera-gateway` | `camera-gateway` | `aws/creds/camera-uploader` |
-| Lambda deployment | `tekton-deployer` | `tekton-lambda-deployer` | `aws/creds/lambda-deployer` |
+## Start the live GitHub trigger
 
-### Workload-authenticated path
+The EventListener is kept private inside the local cluster. GitHub CLI forwards
+real repository webhook events to it for development use.
 
-Start an ephemeral shell with the edge identity:
+Terminal 1 — EventListener:
 
 ```bash
-kubectl run vault-aws-shell \
+kubectl port-forward \
   --namespace vault-tekton-demo \
-  --rm --stdin --tty \
-  --restart=Never \
-  --image=vault-tekton-demo:local \
-  --image-pull-policy=IfNotPresent \
-  --overrides='{"spec":{"serviceAccountName":"camera-gateway"}}' \
-  --command -- sh
+  service/el-github-release \
+  8080:8080 \
+  --address=127.0.0.1
 ```
 
-Inside that shell, exchange the Kubernetes token for a Vault token, then read
-the AWS role. The credential values are exported but never printed:
-
-```sh
-export VAULT_ADDR=http://vault.vault.svc:8200
-
-login_json="$(vault write -format=json auth/kubernetes/login \
-  role=camera-gateway \
-  jwt=@/var/run/secrets/kubernetes.io/serviceaccount/token)"
-export VAULT_TOKEN="$(printf '%s' "${login_json}" | jq -er '.auth.client_token')"
-unset login_json
-
-credential_json="$(vault read -format=json aws/creds/camera-uploader)"
-lease_id="$(printf '%s' "${credential_json}" | jq -er '.lease_id')"
-lease_ttl="$(printf '%s' "${credential_json}" | jq -er '.lease_duration')"
-export AWS_ACCESS_KEY_ID="$(printf '%s' "${credential_json}" | jq -er '.data.access_key')"
-export AWS_SECRET_ACCESS_KEY="$(printf '%s' "${credential_json}" | jq -er '.data.secret_key')"
-export AWS_SESSION_TOKEN="$(printf '%s' "${credential_json}" | jq -er \
-  '.data.security_token // .data.session_token')"
-export AWS_REGION=us-east-1
-unset credential_json VAULT_TOKEN
-
-printf 'Vault lease: %s; TTL: %ss\n' "${lease_id}" "${lease_ttl}"
-aws sts get-caller-identity --region "${AWS_REGION}"
-```
-
-These are real temporary AWS credentials. An assumed-role credential requires
-all three values: access key, secret key, and session token. To request the
-deployer credential instead, use service account `tekton-deployer`, Vault login
-role `tekton-lambda-deployer`, and path `aws/creds/lambda-deployer`.
-
-Clear the shell when finished; the AWS session expires after 15 minutes:
-
-```sh
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
-unset lease_id lease_ttl
-exit
-```
-
-### Local admin shortcut
-
-For troubleshooting only, port-forward Vault and use the dev root token. This
-bypasses Kubernetes authentication, so do not present it as the workload flow:
+Terminal 2 — GitHub webhook forwarding:
 
 ```bash
-kubectl --namespace vault port-forward service/vault 8200:8200
+gh extension install cli/gh-webhook
+gh webhook forward \
+  --repo=OrenAshkenazy/vault-tekton-lambda-cicd-demo \
+  --events=push \
+  --url=http://127.0.0.1:8080
 ```
 
-In a second terminal, replace the credentials in that shell with a fresh
-`camera-uploader` lease:
+This forwarding mode is for a local interview demo, not production. A
+production EventListener should be exposed through authenticated TLS ingress
+and validate the provider's webhook signature.
+
+Terminal 3 — read-only Dashboard:
 
 ```bash
-export VAULT_ADDR=http://127.0.0.1:8200
-credential_json="$(VAULT_TOKEN=demo-root \
-  vault read -format=json aws/creds/camera-uploader)"
-export AWS_ACCESS_KEY_ID="$(printf '%s' "${credential_json}" | jq -er '.data.access_key')"
-export AWS_SECRET_ACCESS_KEY="$(printf '%s' "${credential_json}" | jq -er '.data.secret_key')"
-export AWS_SESSION_TOKEN="$(printf '%s' "${credential_json}" | jq -er \
-  '.data.security_token // .data.session_token')"
-export AWS_REGION=us-east-1
-unset credential_json
-
-aws sts get-caller-identity --region "${AWS_REGION}"
+kubectl port-forward \
+  --namespace tekton-pipelines \
+  service/tekton-dashboard \
+  9097:9097 \
+  --address=127.0.0.1
 ```
 
-Never echo the secret key or session token, paste them into slides, or commit
-them. A new `vault read aws/creds/...` returns a different leased STS session.
+Open <http://127.0.0.1:9097> and select namespace `vault-tekton-demo`. The
+Dashboard has no username or password; use the local port-forward only on a
+trusted single-user workstation and stop it immediately after the demo.
 
-## Live demo
+## Trigger the CI/CD pipeline
+
+Only tags beginning with `demo-` pass the EventListener's CEL filter:
 
 ```bash
-./demo.sh run
+demo_tag="demo-$(date -u +%Y%m%d%H%M%S)"
+git tag "${demo_tag}"
+git push origin "${demo_tag}"
+```
+
+The resulting PipelineRun records the full Git commit SHA as a label, checks
+out exactly that SHA, tests it, and passes it into the Lambda environment as
+`DEPLOYMENT_SHA`.
+
+In the Dashboard show these proofs in order:
+
+1. `fetch-source`: the checked-out SHA matches the GitHub event.
+2. `test-lambda`: handler and credential-leak checks pass.
+3. `deploy-and-verify`: Vault lease ID and 900-second TTL are visible.
+4. The AWS caller is `assumed-role/VaultTektonLambdaCICDDeployer/...`.
+5. `iam:ListUsers` returns `AccessDenied` with that same session.
+6. Serverless deploy succeeds.
+7. The invoked Lambda returns the exact Git SHA from the GitHub event.
+
+Never display the AWS access key, secret key, session token, or Vault token.
+
+## Audit proof
+
+After the PipelineRun succeeds:
+
+```bash
 ./demo.sh audit
 ```
 
-Show these beats in order:
+The command selects the latest CI/CD PipelineRun, prints only its safe proof
+lines, and finds the matching CloudTrail `AssumeRole` event in `us-east-1`.
+CloudTrail Event History can take a few minutes to surface the event; rerun
+`audit` rather than showing an unrelated or stale session.
 
-1. Tekton obtains the `lambda-deployer` lease and runs `serverless deploy`.
-2. Tekton runs the simulated on-prem edge task under a different service account.
-3. The gateway obtains a `camera-uploader` lease and uploads a synthetic SVG image directly to `events/*`.
-4. `PutObject` under `private/*` returns `AccessDenied` with the same credentials.
-5. `GetObject` for the uploaded image returns `AccessDenied`.
-6. S3 emits the object event through EventBridge; Tekton finds the Lambda marker in CloudWatch Logs.
-7. CloudTrail Event History shows Vault's exact `AssumeRole` session in `us-east-1`.
+## Presentation opening and close
 
-CloudTrail management events can take a few minutes to appear. Run the demo once
-before the interview to measure that delay. During the presentation, `audit`
-matches the current edge task's unique assumed-role session; wait and rerun it rather
-than substituting a stale event. The command never displays AWS credentials.
+Open with:
 
-The closing line is:
+> I will push one Git tag and follow that exact Lambda revision through Tekton,
+> Vault, AWS deployment, invocation, and CloudTrail without displaying or
+> storing an AWS credential.
 
-> Compromise it and you can write one prefix, never read the gallery back.
+Close with:
+
+> GitHub proves source provenance, Tekton proves controlled delivery, Vault
+> removes static cloud credentials, IAM limits the deployment identity, and
+> CloudTrail proves exactly what happened.
 
 ## Cleanup
 
@@ -215,6 +212,6 @@ The closing line is:
 ./demo.sh cleanup
 ```
 
-This empties both dedicated buckets, deletes all access keys for the demo
-bootstrap user, deletes both CloudFormation stacks, and deletes the dedicated
-kind cluster.
+This deletes the dedicated Lambda and CloudFormation stacks, empties and
+deletes the deployment bucket, deletes every access key for the dedicated
+bootstrap user, and deletes the dedicated kind cluster.
