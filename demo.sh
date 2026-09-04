@@ -44,6 +44,7 @@ vault_exec() {
 }
 
 install_platform() {
+  local existing_eventlistener_cluster_role
   for tool in docker kind kubectl helm; do require "${tool}"; done
 
   if ! kind get clusters | grep -Fxq "${CLUSTER}"; then
@@ -93,6 +94,13 @@ install_platform() {
   # cannot reliably patch nested fields. Recreate this demo-only template.
   kubectl delete triggertemplate/lambda-cicd \
     --namespace "${NAMESPACE}" --ignore-not-found >/dev/null
+  existing_eventlistener_cluster_role="$(kubectl get clusterrolebinding \
+    github-trigger-eventlistener \
+    --output jsonpath='{.roleRef.name}' 2>/dev/null || true)"
+  if [[ -n "${existing_eventlistener_cluster_role}" && \
+    "${existing_eventlistener_cluster_role}" != vault-tekton-demo-eventlistener-cluster ]]; then
+    kubectl delete clusterrolebinding github-trigger-eventlistener >/dev/null
+  fi
   kubectl apply --filename "${ROOT_DIR}/k8s/demo.yaml"
 }
 
@@ -285,6 +293,7 @@ show_audit() {
 
 check_files() {
   require yq
+  local eventlistener_cluster_resources
   bash -n "${ROOT_DIR}/demo.sh" "${ROOT_DIR}/app/deploy.sh" "${ROOT_DIR}/test/deploy.sh"
   "${ROOT_DIR}/test/deploy.sh"
   python3 "${ROOT_DIR}/test/handler.py"
@@ -295,6 +304,15 @@ check_files() {
   if grep -RIE '(AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|aws_secret_access_key[[:space:]]*=)' \
     "${ROOT_DIR}" --exclude-dir=.git; then
     echo "Possible AWS credential found" >&2
+    exit 1
+  fi
+  eventlistener_cluster_resources="$(yq eval '
+    select(.kind == "ClusterRole" and .metadata.name == "vault-tekton-demo-eventlistener-cluster")
+    | .rules[].resources[]' "${ROOT_DIR}/k8s/demo.yaml")"
+  grep -Fxq clusterinterceptors <<<"${eventlistener_cluster_resources}"
+  grep -Fxq clustertriggerbindings <<<"${eventlistener_cluster_resources}"
+  if grep -Fxq secrets <<<"${eventlistener_cluster_resources}"; then
+    echo "EventListener ClusterRole must not read Secrets" >&2
     exit 1
   fi
   echo "Static checks passed"

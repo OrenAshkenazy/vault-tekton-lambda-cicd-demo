@@ -21,6 +21,87 @@ Kubernetes ID card → Vault visitor badge → AWS keycard → deploy → expire
 
 None is stored as a GitHub or Kubernetes Secret.
 
+## Kubernetes resource map
+
+### Webhook and trigger path
+
+```text
+GitHub push
+   │
+   ▼
+Service/el-github-release
+   │ routes to the Pod managed by Deployment/el-github-release
+   ▼
+EventListener/github-release ──uses──► ServiceAccount/github-trigger
+   ▼
+ClusterInterceptor/cel checks event type, tag prefix, and repository
+   ▼
+TriggerBinding/github-release extracts tag, object ID, and fixed repository URL
+   ▼
+TriggerTemplate/lambda-cicd
+   │ EventListener sink instantiates
+   ▼
+PipelineRun/lambda-cicd-* ──references──► Pipeline/lambda-cicd
+```
+
+The EventListener controller creates its `Service` and `Deployment`. The
+EventListener sink resolves the binding and template, then creates the
+PipelineRun. The PipelineRun references the existing Pipeline definition.
+
+### Pipeline ownership tree
+
+```text
+PipelineRun/lambda-cicd-*
+├─ owns PVC/pvc-*                         shared source workspace
+├─ owns TaskRun/*-fetch-source
+│  └─ owns Pod/*-fetch-source-pod         no service-account token
+├─ owns TaskRun/*-test-lambda
+│  └─ owns Pod/*-test-lambda-pod          no service-account token
+└─ owns TaskRun/*-deploy-and-verify
+   └─ owns Pod/*-deploy-and-verify-pod
+      ├─ uses ServiceAccount/tekton-ci
+      ├─ reads ConfigMap/lambda-cicd-config (non-secret AWS settings)
+      └─ mounts an explicit 10-minute, Vault-audience JWT
+```
+
+The Pipeline controller turns the PipelineRun into three TaskRuns. The TaskRun
+controller creates one Pod for each TaskRun. The PipelineRun owns the shared
+PVC directly.
+
+### Vault validation path
+
+```text
+deploy Pod → Service/vault → StatefulSet Pod/vault-0
+                               │ uses ServiceAccount/vault
+                               ▼
+ClusterRoleBinding/vault-tekton-demo-token-review
+                               │ binds
+                               ▼
+ClusterRole/system:auth-delegator
+                               │ permits TokenReview creation
+                               ▼
+Kubernetes TokenReview API
+```
+
+## What each RBAC object does
+
+| Object | Subject | Permission and reason |
+|---|---|---|
+| `RoleBinding/github-trigger-eventlistener` | `ServiceAccount/github-trigger` | Inside `vault-tekton-demo`: read trigger definitions and ConfigMaps; create PipelineRuns, TaskRuns, PipelineResources, and events; impersonate ServiceAccounts; patch events |
+| `ClusterRole/vault-tekton-demo-eventlistener-cluster` | Bound below | Read/list/watch ClusterInterceptors and ClusterTriggerBindings; unlike Tekton's broader installed role, it grants no Secret access |
+| `ClusterRoleBinding/github-trigger-eventlistener` | `ServiceAccount/github-trigger` | Attach the preceding cluster-scoped read permissions to the EventListener identity |
+| `ClusterRoleBinding/vault-tekton-demo-token-review` | `ServiceAccount/vault` | Use `system:auth-delegator` to create TokenReview and SubjectAccessReview requests |
+| No binding for `tekton-ci` | `ServiceAccount/tekton-ci` | It needs no Kubernetes API permission; its identity is useful to Vault even without Kubernetes RBAC privileges |
+
+Two similarly named objects do different jobs:
+
+- A `RoleBinding` grants permissions only in one namespace.
+- A `ClusterRoleBinding` grants the referenced permissions cluster-wide.
+
+The Tekton and Vault installation controllers have their own platform RBAC.
+They are installation concerns, not identities used by this application
+pipeline.
+
 ## Step 1: Kubernetes gives Tekton an ID card
 
 Only `deploy-and-verify` receives this file:
@@ -49,6 +130,37 @@ vault write auth/kubernetes/login \
   role=tekton-lambda-deployer \
   jwt=@/var/run/secrets/vault/token
 ```
+
+### Why the Pod YAML does not show that command
+
+The Pipeline's Tekton step contains only:
+
+```bash
+/usr/local/bin/deploy-lambda
+```
+
+Tekton writes that snippet into `/tekton/scripts/script-*`. Therefore, the
+generated Pod shows `/tekton/bin/entrypoint` launching the generated script,
+not the nested Vault command. That script calls `/usr/local/bin/deploy-lambda`.
+The `Dockerfile` copies `app/deploy.sh` to that path when it builds the pinned
+tool image, and `vault write` is inside that file.
+
+It runs at this exact point:
+
+```text
+fetch-source succeeds
+        ↓
+test-lambda succeeds
+        ↓
+deploy-and-verify starts
+        ↓
+/usr/local/bin/deploy-lambda
+        ↓
+vault write auth/kubernetes/login
+```
+
+The script uses `set -euo pipefail`, not `set -x`, so logs show the safe
+`1/5 Authenticating...` milestone without echoing the JWT or later credentials.
 
 Vault asks the Kubernetes TokenReview API whether the JWT is genuine. It checks
 the service account, namespace, audience, signature, and expiration.
