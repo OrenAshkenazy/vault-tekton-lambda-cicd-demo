@@ -195,20 +195,6 @@ lines, and finds the matching CloudTrail `AssumeRole` event in `us-east-1`.
 CloudTrail Event History can take a few minutes to surface the event; rerun
 `audit` rather than showing an unrelated or stale session.
 
-## Presentation opening and close
-
-Open with:
-
-> I will push one Git tag and follow that exact Lambda revision through Tekton,
-> Vault, AWS deployment, invocation, and CloudTrail without displaying or
-> storing an AWS credential.
-
-Close with:
-
-> GitHub proves source provenance, Tekton proves controlled delivery, Vault
-> removes static cloud credentials, IAM limits the deployment identity, and
-> CloudTrail proves exactly what happened.
-
 ## Cleanup
 
 ```bash
