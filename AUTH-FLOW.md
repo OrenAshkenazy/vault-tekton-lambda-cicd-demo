@@ -222,11 +222,3 @@ Lambda cannot enumerate IAM users.
 Production Vault would use OIDC or LDAP for humans, Kubernetes Auth for
 workloads, encrypted persistent storage, TLS, auto-unseal, and no root token in
 a script.
-
-## Say this in 20 seconds
-
-> The deploy Task gets a short-lived Kubernetes identity, not an AWS secret.
-> Vault validates that identity with Kubernetes and returns a narrowly scoped
-> Vault token. Vault then assumes the AWS deployment role and provides a
-> 15-minute STS credential. Tekton deploys Lambda, the credentials expire,
-> and CloudTrail records the role assumption.
