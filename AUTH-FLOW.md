@@ -1,4 +1,4 @@
-# Authentication flow: the short, ADHD-friendly version
+# Authentication flow: the short
 
 Remember one sentence:
 
